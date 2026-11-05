@@ -1,12 +1,23 @@
-/** KeSana UI prototype settings. Switch providers here before public launch. */
+/**
+ * KeSana map configuration — dark vector maps, no API key required by default.
+ *
+ * OpenFreeMap (default): free hosted map with attribution.
+ * MapTiler (optional): sign up for a free API key and restrict it to your site
+ * at cloud.maptiler.com; see README.md for setup.
+ */
 export const CONFIG = Object.freeze({
   map: {
-    center: [3.139, 101.6869], // Kuala Lumpur
-    zoom: 12,
+    center: [3.139, 101.6869], // Kuala Lumpur, [latitude, longitude]
+    zoom: 12.2,
     minZoom: 5,
     maxZoom: 19,
-    tileUrl: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>'
+    pitch: 28,
+    maxPitch: 65,
+    enable3DBuildings: true,
+    provider: 'openfreemap', // 'openfreemap' or 'maptiler'
+    openFreeMapStyle: 'https://tiles.openfreemap.org/styles/dark',
+    mapTilerStyle: 'streets-v4-dark',
+    mapTilerApiKey: '' // Leave blank unless using MapTiler.
   },
   search: {
     endpoint: 'https://photon.komoot.io/api/',

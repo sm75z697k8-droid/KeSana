@@ -1,102 +1,232 @@
+import * as maplibregl from 'https://unpkg.com/maplibre-gl@6.16.0/dist/maplibre-gl.mjs';
 import { CONFIG } from './config.js';
 
 let map;
 let destinationMarker;
 let currentLocationMarker;
-let accuracyCircle;
+let latestPosition;
+let movedToPlace = 0;
 
-function destinationIcon() {
-  return L.divIcon({
-    className: 'destination-icon-wrap',
-    html: '<span class="destination-pin"><span class="destination-pin-core"></span></span>',
-    iconSize: [38, 46],
-    iconAnchor: [19, 42],
-    popupAnchor: [0, -41]
-  });
-}
+const ACCURACY_SOURCE_ID = 'kesana-location-accuracy';
+const ACCURACY_LAYER_ID = 'kesana-location-accuracy-fill';
+const ACCURACY_OUTLINE_ID = 'kesana-location-accuracy-outline';
 
-function userIcon() {
-  return L.divIcon({
-    className: 'user-icon-wrap',
-    html: '<span class="user-location-dot"></span>',
-    iconSize: [34, 34],
-    iconAnchor: [17, 17]
-  });
-}
-
-export function initMap() {
-  if (typeof L === 'undefined') {
-    throw new Error('Map library failed to load. Check your internet connection.');
+function mapStyle() {
+  const { provider, mapTilerApiKey, mapTilerStyle, openFreeMapStyle } = CONFIG.map;
+  if (provider === 'maptiler' && mapTilerApiKey.trim()) {
+    return `https://api.maptiler.com/maps/${encodeURIComponent(mapTilerStyle)}/style.json?key=${encodeURIComponent(mapTilerApiKey.trim())}`;
   }
-  map = L.map('map', {
-    zoomControl: false,
-    attributionControl: true,
-    preferCanvas: true,
-    zoomSnap: 0.25,
-    zoomDelta: 0.75,
+  return openFreeMapStyle;
+}
+
+function markerElement(type) {
+  const el = document.createElement('div');
+  if (type === 'destination') {
+    el.className = 'destination-icon-wrap';
+    el.innerHTML = '<span class="destination-pin"><span class="destination-pin-core"></span></span>';
+  } else {
+    el.className = 'user-icon-wrap';
+    el.innerHTML = '<span class="user-location-dot"></span>';
+  }
+  return el;
+}
+
+function popupContent(place) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'place-popup';
+
+  const eyebrow = document.createElement('span');
+  eyebrow.className = 'place-popup-kicker';
+  eyebrow.textContent = 'SELECTED PLACE';
+
+  const name = document.createElement('strong');
+  name.textContent = place.name;
+  wrapper.append(eyebrow, name);
+
+  if (place.secondary) {
+    const subtitle = document.createElement('span');
+    subtitle.textContent = place.secondary;
+    wrapper.append(subtitle);
+  }
+  return wrapper;
+}
+
+/** Circle in WGS84 coordinates, for the browser geolocation accuracy estimate. */
+function accuracyGeometry({ latitude, longitude, accuracy }) {
+  const radius = Math.min(Math.max(Number(accuracy) || 25, 10), 15000);
+  const latRadius = radius / 111320;
+  const lonRadius = radius / (111320 * Math.max(0.05, Math.cos(latitude * Math.PI / 180)));
+  const ring = [];
+  for (let step = 0; step <= 64; step += 1) {
+    const angle = 2 * Math.PI * step / 64;
+    ring.push([
+      longitude + lonRadius * Math.cos(angle),
+      latitude + latRadius * Math.sin(angle)
+    ]);
+  }
+  return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } };
+}
+
+function updateAccuracyOverlay() {
+  if (!map || !latestPosition || !map.isStyleLoaded()) return;
+  const geojson = { type: 'FeatureCollection', features: [accuracyGeometry(latestPosition)] };
+  const source = map.getSource(ACCURACY_SOURCE_ID);
+  if (source) {
+    source.setData(geojson);
+    return;
+  }
+  map.addSource(ACCURACY_SOURCE_ID, { type: 'geojson', data: geojson });
+  map.addLayer({
+    id: ACCURACY_LAYER_ID,
+    type: 'fill',
+    source: ACCURACY_SOURCE_ID,
+    paint: { 'fill-color': '#9dceb0', 'fill-opacity': 0.10 }
+  });
+  map.addLayer({
+    id: ACCURACY_OUTLINE_ID,
+    type: 'line',
+    source: ACCURACY_SOURCE_ID,
+    paint: { 'line-color': '#a6d5b5', 'line-width': 1.15, 'line-opacity': 0.42 }
+  });
+}
+
+/** Overlay subtle 3D buildings only when the chosen vector style has building data. */
+function addBuildingsIfSupported() {
+  if (!CONFIG.map.enable3DBuildings || !map?.isStyleLoaded()) return;
+  const style = map.getStyle();
+  if (!style?.layers?.length || map.getLayer('kesana-buildings-3d')) return;
+
+  // Respect styles that already draw their own extruded buildings.
+  if (style.layers.some(layer => layer.type === 'fill-extrusion' && layer['source-layer'] === 'building')) return;
+  const buildingLayer = style.layers.find(layer => layer['source-layer'] === 'building' && layer.source);
+  const sourceId = buildingLayer?.source ||
+    Object.keys(style.sources || {}).find(id => style.sources[id]?.type === 'vector');
+  if (!sourceId) return;
+
+  // Put buildings under symbol labels so roads and place names remain readable.
+  const firstLabelId = style.layers.find(layer => layer.type === 'symbol')?.id;
+  map.addLayer({
+    id: 'kesana-buildings-3d',
+    type: 'fill-extrusion',
+    source: sourceId,
+    'source-layer': 'building',
+    minzoom: 15,
+    paint: {
+      'fill-extrusion-color': '#40594b',
+      'fill-extrusion-height': ['coalesce', ['get', 'render_height'], ['get', 'height'], 9],
+      'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0],
+      'fill-extrusion-opacity': 0.61,
+      'fill-extrusion-vertical-gradient': true
+    }
+  }, firstLabelId);
+}
+
+/** Initialize MapLibre with an actual dark vector basemap rather than filtered raster tiles. */
+export function initMap(onError) {
+  if (!maplibregl.supported()) {
+    throw new Error('This map requires WebGL. Please try Safari on a newer iPhone or iOS version.');
+  }
+
+  map = new maplibregl.Map({
+    container: 'map',
+    style: mapStyle(),
+    center: [CONFIG.map.center[1], CONFIG.map.center[0]],
+    zoom: CONFIG.map.zoom,
     minZoom: CONFIG.map.minZoom,
     maxZoom: CONFIG.map.maxZoom,
-    tap: false
-  }).setView(CONFIG.map.center, CONFIG.map.zoom);
+    pitch: CONFIG.map.pitch,
+    maxPitch: CONFIG.map.maxPitch,
+    bearing: 0,
+    antialias: true,
+    attributionControl: false,
+    renderWorldCopies: false,
+    locale: { 'AttributionControl.MapFeedback': 'Map feedback' }
+  });
 
-  L.tileLayer(CONFIG.map.tileUrl, {
-    maxZoom: CONFIG.map.maxZoom,
-    maxNativeZoom: 19,
-    attribution: CONFIG.map.attribution,
-    updateWhenIdle: true,
-    keepBuffer: 2
-  }).addTo(map);
+  map.addControl(new maplibregl.AttributionControl({ compact: false }), 'bottom-left');
 
+  let didLoad = false;
+  let reportedError = false;
+  map.on('load', () => {
+    didLoad = true;
+    addBuildingsIfSupported();
+    updateAccuracyOverlay();
+  });
+  map.on('error', event => {
+    if (!didLoad && !reportedError && typeof onError === 'function') {
+      reportedError = true;
+      onError('Could not load the vector map. Check your connection and try refreshing.');
+    }
+    console.warn('KeSana map:', event.error?.message || event);
+  });
   return map;
 }
 
 export function zoomIn() {
-  map?.zoomIn();
+  map?.zoomIn({ duration: 350 });
 }
 
 export function zoomOut() {
-  map?.zoomOut();
+  map?.zoomOut({ duration: 350 });
 }
 
 export function moveToPlace(place) {
   if (!map || !Number.isFinite(place.lat) || !Number.isFinite(place.lon)) return;
-  const position = [place.lat, place.lon];
+  const position = [place.lon, place.lat];
 
   if (!destinationMarker) {
-    destinationMarker = L.marker(position, {
-      icon: destinationIcon(),
-      keyboard: false
-    }).addTo(map);
+    destinationMarker = new maplibregl.Marker({
+      element: markerElement('destination'),
+      anchor: 'bottom'
+    }).setLngLat(position).addTo(map);
   } else {
-    destinationMarker.setLatLng(position);
+    destinationMarker.setLngLat(position);
   }
 
-  destinationMarker.bindPopup(
-    `<div class="place-popup"><span class="place-popup-kicker">SELECTED PLACE</span><strong>${escapeHTML(place.name)}</strong>${place.secondary ? `<span>${escapeHTML(place.secondary)}</span>` : ''}</div>`,
-    { autoPan: false, closeButton: false, offset: [0, -2], className: 'kesana-popup' }
-  );
+  const popup = new maplibregl.Popup({
+    className: 'kesana-popup',
+    closeButton: false,
+    closeOnClick: false,
+    offset: 36,
+    maxWidth: '250px'
+  }).setDOMContent(popupContent(place));
 
-  map.flyTo(position, Math.max(map.getZoom(), 13.5), { animate: true, duration: 1.05 });
-  setTimeout(() => destinationMarker?.openPopup(), 1150);
+  destinationMarker.setPopup(popup);
+  const ticket = ++movedToPlace;
+  map.once('moveend', () => {
+    if (ticket === movedToPlace && destinationMarker && !popup.isOpen()) {
+      popup.addTo(map);
+    }
+  });
+  map.flyTo({
+    center: position,
+    zoom: Math.max(map.getZoom(), 14.25),
+    pitch: Math.max(map.getPitch(), 36),
+    bearing: map.getBearing(),
+    duration: 1050,
+    essential: true
+  });
 }
 
 export function showUserLocation({ latitude, longitude, accuracy }) {
-  if (!map) return;
-  const position = [latitude, longitude];
-  if (!currentLocationMarker) {
-    currentLocationMarker = L.marker(position, { icon: userIcon(), keyboard: false, zIndexOffset: 1000 }).addTo(map);
-  } else {
-    currentLocationMarker.setLatLng(position);
-  }
-  if (!accuracyCircle) {
-    accuracyCircle = L.circle(position, { radius: accuracy || 25, color: '#a9dfb7', weight: 1, fillColor: '#a9dfb7', fillOpacity: 0.1, opacity: 0.3, interactive: false }).addTo(map);
-  } else {
-    accuracyCircle.setLatLng(position).setRadius(accuracy || 25);
-  }
-  map.flyTo(position, Math.max(map.getZoom(), 15), { animate: true, duration: 0.9 });
-}
+  if (!map || !Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+  const position = [longitude, latitude];
+  latestPosition = { latitude, longitude, accuracy };
 
-/** Escape text before inserting it in Leaflet's popup HTML. */
-function escapeHTML(value) {
-  return String(value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+  if (!currentLocationMarker) {
+    currentLocationMarker = new maplibregl.Marker({
+      element: markerElement('user'),
+      anchor: 'center'
+    }).setLngLat(position).addTo(map);
+  } else {
+    currentLocationMarker.setLngLat(position);
+  }
+  updateAccuracyOverlay();
+  map.flyTo({
+    center: position,
+    zoom: Math.max(map.getZoom(), 15),
+    pitch: map.getPitch(),
+    duration: 900,
+    essential: true
+  });
 }
