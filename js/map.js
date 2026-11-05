@@ -123,11 +123,8 @@ function addBuildingsIfSupported() {
 
 /** Initialize MapLibre with an actual dark vector basemap rather than filtered raster tiles. */
 export function initMap(onError) {
-  if (!maplibregl.supported()) {
-    throw new Error('This map requires WebGL. Please try Safari on a newer iPhone or iOS version.');
-  }
-
-  map = new maplibregl.Map({
+  try {
+    map = new maplibregl.Map({
     container: 'map',
     style: mapStyle(),
     center: [CONFIG.map.center[1], CONFIG.map.center[0]],
@@ -141,7 +138,13 @@ export function initMap(onError) {
     attributionControl: false,
     renderWorldCopies: false,
     locale: { 'AttributionControl.MapFeedback': 'Map feedback' }
-  });
+    });
+  } catch (error) {
+    if (error instanceof maplibregl.GPUInitializationError) {
+      throw new Error('This vector map needs WebGL2. Please use an up-to-date iPhone Safari browser.');
+    }
+    throw error;
+  }
 
   map.addControl(new maplibregl.AttributionControl({ compact: false }), 'bottom-left');
 
